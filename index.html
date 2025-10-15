@@ -2,48 +2,71 @@
 <html lang="zh-Hant">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>⚡ AI 股票分析儀表板（即時）</title>
-  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet"/>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>⚡ AI 股票分析儀表板（即時股價）</title>
+  <!-- Tailwind（用於簡單排版） -->
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+  <!-- Lightweight Charts（蠟燭圖 + 均線 + 量能） -->
+  <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+  <style>
+    body { background:#0b1220; color:#e5e7eb; }
+    .card { background:#111827; border:1px solid #374151; border-radius:12px; padding:16px; }
+    .card-title { color:#c7d2fe; margin-bottom:8px; }
+    .btn { background:#6366f1; border-radius:8px; padding:10px 14px; }
+    .btn:active { transform: scale(.98); }
+    input, select { background:#1f2937; border:1px solid #374151; border-radius:8px; color:#e5e7eb; }
+    a { color:#93c5fd; }
+  </style>
 </head>
-<body class="bg-gray-900 text-gray-100">
-  <header class="p-4 bg-gray-800 border-b border-gray-700 space-y-2">
+<body class="min-h-screen">
+  <header class="p-4 bg-gray-900 border-b border-gray-700">
     <h1 class="text-xl font-semibold">⚡ AI 股票分析儀表板（即時股價）</h1>
-    <p class="text-sm opacity-70">台股只輸入數字（自動加 .TW），美股直接代號（如 AAPL）。</p>
-    <div class="flex gap-2">
-      <input id="symbol" class="flex-1 px-3 py-2 rounded bg-gray-700 border border-gray-600" placeholder="例：2330 或 AAPL"/>
-      <button id="fetchBtn" class="bg-indigo-600 px-3 py-2 rounded hover:bg-indigo-500">開始分析</button>
+    <p class="text-sm opacity-70 mt-1">台股僅輸入數字（自動加 .TW），美股直接代號（如 AAPL）。</p>
+
+    <div class="mt-3 flex gap-2">
+      <input id="symbol" class="px-3 py-2 flex-1" placeholder="輸入股票代號（如 2330 或 AAPL）" />
+      <button id="fetchBtn" class="btn">開始分析</button>
     </div>
-    <div id="status" class="text-xs opacity-70">就緒</div>
+    <p id="status" class="text-xs opacity-70 mt-1"></p>
   </header>
 
   <main class="p-4 space-y-4">
+    <!-- 即時價 -->
     <section class="card">
-      <div class="card-title text-lg mb-2">即時價格資訊</div>
-      <p id="priceInfo" class="text-2xl font-bold">—</p>
-      <p id="updateTime" class="text-sm opacity-70">—</p>
+      <div class="card-title text-lg">即時價格資訊</div>
+      <p id="priceInfo" class="text-base">—</p>
+      <p id="updateTime" class="text-xs opacity-70 mt-1">—</p>
     </section>
 
+    <!-- K 線區（含 MA5/20/60 + 成交量） -->
     <section class="card">
-      <div class="card-title text-lg mb-2">價格走勢圖（近 3 個月）</div>
-      <canvas id="priceChart" height="220"></canvas>
+      <div class="card-title text-lg">K 線（蠟燭圖 + MA5/20/60 + 成交量）</div>
+
+      <div class="flex gap-2 mb-3">
+        <select id="kInterval" class="px-2 py-2">
+          <option value="1d" selected>日線</option>
+          <option value="5m">5 分線</option>
+          <option value="15m">15 分線</option>
+          <option value="30m">30 分線</option>
+          <option value="60m">60 分線</option>
+        </select>
+        <button id="kRefresh" class="btn">更新 K 線</button>
+      </div>
+
+      <div id="kChart" style="height:420px;"></div>
+      <div id="kLegend" class="text-xs opacity-75 mt-2">—</div>
     </section>
 
+    <!-- AI 區（未接金鑰先保留） -->
     <section class="card">
-      <div class="card-title text-lg mb-2">AI 分析建議</div>
-      <pre id="aiAdvice" class="whitespace-pre-wrap text-sm">—</pre>
-      <div class="text-xs opacity-60 mt-2">未設定代理時會顯示規則版建議。</div>
+      <div class="card-title text-lg">AI 分析建議</div>
+      <p id="aiAdvice" class="whitespace-pre-wrap text-sm opacity-90">（之後可接 OpenAI 代理）</p>
     </section>
   </main>
 
-  <footer class="p-4 text-xs text-center opacity-60 border-t border-gray-700">
-    © 2025 Demo
+  <footer class="p-4 text-xs text-center opacity-60">
+    © 2025 AI 股票分析儀表板 Demo
   </footer>
-
-  <style>
-    .card { background:#111827; border:1px solid #374151; border-radius:.5rem; padding:1rem; }
-  </style>
 
   <script src="./script.js"></script>
 </body>
