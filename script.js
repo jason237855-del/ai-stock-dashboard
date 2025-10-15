@@ -1,5 +1,5 @@
 // ====== 設定區 ======
-const OPENAI_PROXY_URL = "";   // 之後要用 Cloudflare Worker 再填
+const OPENAI_PROXY_URL = "";   // 之後有 Cloudflare Worker 再填
 const OPENAI_MODEL     = "gpt-5";
 
 // ====== 工具 ======
@@ -7,7 +7,7 @@ const statusEl   = document.getElementById('status');
 const priceInfo  = document.getElementById('priceInfo');
 const updateTime = document.getElementById('updateTime');
 const adviceEl   = document.getElementById('aiAdvice');
-function setStatus(m){ statusEl.textContent = m; }
+function setStatus(m){ if(statusEl) statusEl.textContent = m; }
 
 // 台股純數字自動補 .TW
 function normalizeSymbol(input){
@@ -15,34 +15,44 @@ function normalizeSymbol(input){
   return /^\d+$/.test(s) ? s + ".TW" : s;
 }
 
-// ====== 取價（Yahoo，含代理備援） ======
-async function fetchYahooChart(symbol, range='3mo', interval='1d'){
-  const core = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`;
-  const viaProxy = `https://cors.isomorphic-git.org/${core}`;
-  try{
-    setStatus('連線 Yahoo Finance…');
-    let r = await fetch(core, {mode:'cors'});
-    if(!r.ok) throw new Error('direct fetch blocked');
-    return await r.json();
-  }catch(e){
-    setStatus('直接連線受阻，改用代理…');
-    let r2 = await fetch(viaProxy, {mode:'cors'});
-    if(!r2.ok) throw new Error('proxy fetch failed');
-    return await r2.json();
+// ====== 抓價（多層代理備援） ======
+async function fetchWithFallback(url) {
+  const tries = [
+    { name: "direct", url }, // 直接連
+    { name: "isomorphic-cors", url: "https://cors.isomorphic-git.org/" + url },
+    { name: "allorigins", url: "https://api.allorigins.win/raw?url=" + encodeURIComponent(url) },
+  ];
+  let lastErr;
+  for (const t of tries) {
+    try {
+      setStatus(`連線中：${t.name}…`);
+      const r = await fetch(t.url, { mode: "cors" });
+      if (!r.ok) throw new Error(`${t.name} http ${r.status}`);
+      return await r.json();
+    } catch (e) {
+      lastErr = e;
+      console.warn("fetch failed on", t.name, e);
+    }
   }
+  throw lastErr || new Error("all fetch attempts failed");
 }
 
-// ====== 繪圖 ======
+async function fetchYahooChart(symbol, range='3mo', interval='1d'){
+  const base = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`;
+  return fetchWithFallback(base);
+}
+
+// ====== 畫圖 ======
 let chart;
 function drawChart(labels, data, symbol){
   const ctx = document.getElementById("priceChart").getContext("2d");
   if(chart) chart.destroy();
   chart = new Chart(ctx, {
     type:'line',
-    data:{ labels, datasets:[{ label:`${symbol} 收盤價`, data, borderColor:'rgb(75,192,192)', fill:false, tension:0.2 }]},
+    data:{ labels, datasets:[{ label:`${symbol} 收盤價`, data, borderColor:'rgb(75,192,192)', fill:false, tension:0.2, pointRadius:0 }]},
     options:{
       plugins:{ legend:{ labels:{ color:'#ddd'} } },
-      scales:{ x:{ ticks:{ color:'#aaa' }}, y:{ ticks:{ color:'#aaa' }} }
+      scales:{ x:{ ticks:{ color:'#aaa'} }, y:{ ticks:{ color:'#aaa'} } }
     }
   });
 }
@@ -82,7 +92,8 @@ async function gptAdvice(symbol, closes){
 
 // ====== 主流程 ======
 document.getElementById("fetchBtn").addEventListener("click", async () => {
-  const symbol = normalizeSymbol(document.getElementById("symbol").value);
+  const raw = document.getElementById("symbol").value;
+  const symbol = normalizeSymbol(raw);
   if(!symbol){ alert("請輸入代號，如 2330 或 AAPL"); return; }
 
   try{
@@ -111,9 +122,6 @@ document.getElementById("fetchBtn").addEventListener("click", async () => {
   }catch(err){
     console.error(err);
     setStatus('讀取失敗：' + err.message + '（先試 AAPL 或 2330）');
-    priceInfo.textContent = '—';
-    updateTime.textContent = '—';
-    adviceEl.textContent = '—';
     alert('讀取失敗：' + err.message);
   }
 });
