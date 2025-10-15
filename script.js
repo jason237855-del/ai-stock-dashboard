@@ -1,464 +1,267 @@
-// ===================== 開關與設定 =====================
-// 如果你已經有 Cloudflare Worker / 代理端點可以轉 OpenAI API，填在這裡：
-// 例如： const OPENAI_PROXY_URL = "https://你的域名/ai-proxy";
-const OPENAI_PROXY_URL = "";   // 先留空也沒關係 → 會只用本地規則建議
-const OPENAI_MODEL = "gpt-5";  // 你的模型代號（代理那邊會轉）
+/* =========================================================
+   AI 股票儀表板 - 最簡版（不用 Worker / 不用金鑰）
+   台股即時價優先 TWSE，失敗才退 Yahoo
+   日K/分K仍走 Yahoo（免費來源通常有延遲）
+   ========================================================= */
 
-// ===================== DOM & 小工具 =====================
+/* ---------- DOM ---------- */
 const $ = (id) => document.getElementById(id);
-const statusEl = $("status");
-const adviceEl = $("aiAdvice");
+const symbolInput = $("symbol");
+const fetchBtn     = $("fetchBtn");
+const statusEl     = $("status");
+const priceInfoEl  = $("priceInfo");
+const updateTimeEl = $("updateTime");
+const kIntervalSel = $("kInterval");
+const kRefreshBtn  = $("kRefresh");
+const kChartBox    = $("kChart");
+const kLegend      = $("kLegend");
+const aiAdviceEl   = $("aiAdvice");
 
-function setStatus(msg){ if(statusEl) statusEl.textContent = msg; }
-function safeSetAdvice(text){ if(adviceEl) adviceEl.textContent = text || "（暫無資料）"; }
-
-// 台股只輸入數字就自動加 .TW；美股直接代號
-function normalizeSymbol(input){
-  const s = (input || "").trim().toUpperCase();
-  if(!s) return s;
+/* ---------- 小工具 ---------- */
+function setStatus(msg){ if(statusEl) statusEl.textContent = msg || ""; }
+function isTW(input){
+  const s = String(input||"").trim().toUpperCase();
+  return /\.TW$/.test(s) || /^\d+$/.test(s);
+}
+function normSymbol(input){
+  const s = String(input||"").trim().toUpperCase();
   return /^\d+$/.test(s) ? `${s}.TW` : s;
 }
-
-function fetchTimeout(url, opt = {}, ms = 8000){
-  return new Promise((resolve, reject)=>{
-    const id = setTimeout(()=>reject(new Error("timeout")), ms);
-    fetch(url, opt).then(r=>{ clearTimeout(id); resolve(r); })
-                   .catch(e=>{ clearTimeout(id); reject(e); });
-  });
+function onlyNumber(symTW){
+  return String(symTW||"").toUpperCase().replace(".TW","").replace(/\D/g,"");
+}
+function tsToLocal(ts){
+  if(!ts) return "—";
+  const d = new Date(ts*1000);
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
 }
 
-// 多路徑 + 重試
-async function fetchJSONWithRetry(urls, opt = {}, tries = 3){
+/* ---------- 逾時/重試 ---------- */
+function fetchTimeout(url, opt={}, ms=8000){
+  return new Promise((resolve,reject)=>{
+    const id = setTimeout(()=>reject(new Error("timeout")), ms);
+    fetch(url, {...opt, mode:"cors"}).then(r=>{clearTimeout(id);resolve(r)}).catch(e=>{clearTimeout(id);reject(e)});
+  });
+}
+async function fetchTextMulti(routes, tries=3){
   let lastErr;
-  for(let round = 0; round < Math.max(tries,1); round++){
-    for(const {name, url} of urls){
+  for(let t=0;t<tries;t++){
+    for(const {name,url} of routes){
       try{
         setStatus(`連線中：${name}…`);
-        const res = await fetchTimeout(url, {...opt, mode:"cors"}, 8000);
+        const res = await fetchTimeout(url, {}, 8000);
         if(!res.ok) throw new Error(`${name} http ${res.status}`);
-        return await res.json();
-      }catch(e){ lastErr = e; }
+        return await res.text();
+      }catch(e){ lastErr=e; }
     }
-    await new Promise(s=>setTimeout(s, 500 + round * 300));
+    await new Promise(s=>setTimeout(s, 300+t*200));
   }
   throw lastErr || new Error("all routes failed");
 }
-
-// ===================== Yahoo Finance 來源 =====================
-async function fetchYahooChart(symbol, range = "6mo", interval = "1d"){
-  const core = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=${interval}`;
-  const bust = `&_=${Date.now()}`;
-  const routes = [
-    { name:"isomorphic", url:"https://cors.isomorphic-git.org/" + core + bust },
-    { name:"allorigins", url:"https://api.allorigins.win/raw?url=" + encodeURIComponent(core + bust) },
-    { name:"thingproxy", url:"https://thingproxy.freeboard.io/fetch/" + core + bust },
-    { name:"direct",     url: core + bust },
-  ];
-  return fetchJSONWithRetry(routes, {}, 2);
+async function fetchJSONMulti(routes, tries=3){
+  const txt = await fetchTextMulti(routes, tries);
+  try{ return JSON.parse(txt); }
+  catch{
+    // 有些回傳前面會多字元（JSONP/防呆），嘗試剝頭
+    const clean = (txt||"").replace(/^[^{[]+/,"");
+    return JSON.parse(clean);
+  }
 }
 
-// ===================== 轉換與指標 =====================
-function toCandles(json){
-  const r = json?.chart?.result?.[0];
-  if(!r) throw new Error("chart result not found");
+/* =========================================================
+   台股（TW）即時價：TWSE MIS，失敗才退 Yahoo Quote
+   ========================================================= */
+// TWSE MIS: https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_2330.tw
+async function twseRealtime(symTW){
+  const num = onlyNumber(symTW);
+  const base = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_${num}.tw&_=${Date.now()}`;
+  const routes = [
+    {name:"isomorphic", url:"https://cors.isomorphic-git.org/" + base},
+    {name:"allorigins", url:"https://api.allorigins.win/raw?url=" + encodeURIComponent(base)},
+    {name:"thingproxy", url:"https://thingproxy.freeboard.io/fetch/" + base},
+    {name:"direct",     url: base},
+  ];
+  const j = await fetchJSONMulti(routes, 2);
+  const row = j?.msgArray?.[0];
+  if(!row) throw new Error("TWSE 無資料");
+  return {
+    last: Number(row.z || row.y || 0),
+    open: Number(row.o||0),
+    high: Number(row.h||0),
+    low:  Number(row.l||0),
+    time: Number(row.tlong||0)/1000
+  };
+}
+
+// Yahoo Quote: https://query1.finance.yahoo.com/v7/finance/quote?symbols=AAPL
+async function yahooQuote(symbol){
+  const core = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbol)}&_=${Date.now()}`;
+  const routes = [
+    {name:"isomorphic", url:"https://cors.isomorphic-git.org/" + core},
+    {name:"allorigins", url:"https://api.allorigins.win/raw?url=" + encodeURIComponent(core)},
+    {name:"thingproxy", url:"https://thingproxy.freeboard.io/fetch/" + core},
+    {name:"direct",     url: core},
+  ];
+  const j = await fetchJSONMulti(routes, 2);
+  const r = j?.quoteResponse?.result?.[0];
+  if(!r) throw new Error("Yahoo 無報價");
+  const ts = Math.floor((r.regularMarketTime || r.postMarketTime || Date.now()/1000));
+  return {
+    last: Number(r.regularMarketPrice ?? r.postMarketPrice ?? r.bid ?? r.ask ?? 0),
+    open: Number(r.regularMarketOpen ?? 0),
+    high: Number(r.regularMarketDayHigh ?? 0),
+    low:  Number(r.regularMarketDayLow ?? 0),
+    time: ts
+  };
+}
+
+// 封裝：即時價（台股→TWSE，否則→Yahoo；台股失敗才退 Yahoo）
+async function getRealtime(symbolRaw){
+  const sym = normSymbol(symbolRaw);
+  if(isTW(sym)){
+    try { return await twseRealtime(sym); }
+    catch { return await yahooQuote(sym); }
+  }else{
+    return await yahooQuote(sym);
+  }
+}
+
+/* =========================================================
+   K 線：Yahoo chart（range/interval 可切）
+   ========================================================= */
+// Yahoo Chart: https://query1.finance.yahoo.com/v8/finance/chart/2330.TW?range=6mo&interval=1d
+async function yahooChart(symbol, range="6mo", interval="1d"){
+  const core = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=${interval}&_=${Date.now()}`;
+  const routes = [
+    {name:"isomorphic", url:"https://cors.isomorphic-git.org/" + core},
+    {name:"allorigins", url:"https://api.allorigins.win/raw?url=" + encodeURIComponent(core)},
+    {name:"thingproxy", url:"https://thingproxy.freeboard.io/fetch/" + core},
+    {name:"direct",     url: core},
+  ];
+  const j = await fetchJSONMulti(routes, 2);
+  const r = j?.chart?.result?.[0];
+  if(!r) throw new Error("Yahoo K 線無資料");
   const ts = r.timestamp || [];
   const q  = r.indicators?.quote?.[0] || {};
   const o=q.open||[], h=q.high||[], l=q.low||[], c=q.close||[], v=q.volume||[];
-
-  const candles = [], volumes = [];
+  const candles=[], volumes=[];
   for(let i=0;i<ts.length;i++){
-    if(o[i]==null || h[i]==null || l[i]==null || c[i]==null) continue;
+    if(o[i]==null||h[i]==null||l[i]==null||c[i]==null) continue;
     const bar = { time: ts[i], open:+o[i], high:+h[i], low:+l[i], close:+c[i] };
     candles.push(bar);
-    volumes.push({
-      time: ts[i],
-      value: +(v[i]||0),
-      color: bar.close >= bar.open ? "#26a69a" : "#ef5350"
-    });
+    volumes.push({ time: ts[i], value:+(v[i]||0), color: bar.close>=bar.open ? "#26a69a" : "#ef5350" });
   }
-  return { candles, volumes };
+  return {candles, volumes};
 }
 
-function smaSeries(candles, n){
-  const out = [];
-  let sum = 0;
-  const q = [];
-  for(const c of candles){
-    q.push(c.close);
-    sum += c.close;
-    if(q.length > n) sum -= q.shift();
-    out.push({ time:c.time, value: sum / q.length });
+/* =========================================================
+   繪圖（Lightweight Charts）+ MA5/20/60 + 量能
+   ========================================================= */
+let chart, candleSeries, volSeries, ma5, ma20, ma60;
+
+function ensureChart(){
+  if(chart) return;
+  chart = LightweightCharts.createChart(kChartBox, {
+    layout:{ background:{color:"#0b1220"}, textColor:"#cbd5e1" },
+    grid:{ vertLines:{color:"#1f2937"}, horzLines:{color:"#1f2937"} },
+    rightPriceScale:{ borderColor:"#374151" },
+    timeScale:{ borderColor:"#374151" },
+    crosshair:{ mode: LightweightCharts.CrosshairMode.Normal },
+    height: 420,
+  });
+  candleSeries = chart.addCandlestickSeries({
+    upColor:"#26a69a", downColor:"#ef5350", wickUpColor:"#26a69a", wickDownColor:"#ef5350", borderVisible:false
+  });
+  volSeries = chart.addHistogramSeries({ priceFormat:{type:"volume"}, priceScaleId:"", color:"#60a5fa",  });
+  ma5  = chart.addLineSeries({ color:"#fbbf24", lineWidth:2 });
+  ma20 = chart.addLineSeries({ color:"#a78bfa", lineWidth:2 });
+  ma60 = chart.addLineSeries({ color:"#60a5fa", lineWidth:2 });
+}
+
+function sma(data, period){
+  const out=[]; let sum=0;
+  for(let i=0;i<data.length;i++){
+    const v = data[i].close;
+    sum += v;
+    if(i>=period) sum -= data[i-period].close;
+    if(i>=period-1) out.push({ time:data[i].time, value: +(sum/period).toFixed(2) });
   }
   return out;
 }
 
-// RSI(14)
-function rsiSeries(candles, period = 14){
-  const out = [];
-  if(candles.length < period+1) return out;
-  let gain = 0, loss = 0;
-  for(let i=1;i<=period;i++){
-    const diff = candles[i].close - candles[i-1].close;
-    if(diff >= 0) gain += diff; else loss -= diff;
-  }
-  let avgGain = gain / period;
-  let avgLoss = loss / period;
-  out.push({ time:candles[period].time, value: avgLoss === 0 ? 100 : 100 - (100/(1 + avgGain/avgLoss)) });
-
-  for(let i=period+1;i<candles.length;i++){
-    const diff = candles[i].close - candles[i-1].close;
-    const g = diff > 0 ? diff : 0;
-    const l = diff < 0 ? -diff : 0;
-    avgGain = (avgGain*(period-1) + g)/period;
-    avgLoss = (avgLoss*(period-1) + l)/period;
-    const rs = avgLoss === 0 ? 100 : 100 - (100/(1 + avgGain/avgLoss));
-    out.push({ time:candles[i].time, value: rs });
-  }
-  return out;
-}
-
-// ATR(14)
-function atr(candles, period = 14){
-  if(candles.length < period+1) return 0;
-  const trs = [];
-  for(let i=1;i<candles.length;i++){
-    const h = candles[i].high, l = candles[i].low, pc = candles[i-1].close;
-    const tr = Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
-    trs.push(tr);
-  }
-  const n = Math.min(period, trs.length);
-  let s = 0;
-  for(let i=trs.length-n;i<trs.length;i++) s += trs[i];
-  return s / n;
-}
-
-// ===================== 圖表 =====================
-let kChart, sCandle, sVol, sMA5, sMA20, sMA60;
-
-function ensureKChart(){
-  if(kChart) return;
-  kChart = LightweightCharts.createChart($("kChart"), {
-    layout: { background:{ color:"#0b1220" }, textColor:"#e5e7eb" },
-    grid:   { vertLines:{ color:"#1f2937" },  horzLines:{ color:"#1f2937" } },
-    timeScale: { rightOffset:2, borderColor:"#334155" },
-    rightPriceScale: { borderColor:"#334155" },
-    crosshair: { mode: LightweightCharts.CrosshairMode.Normal }
-  });
-  sCandle = kChart.addCandlestickSeries({
-    upColor:"#26a69a", downColor:"#ef5350",
-    borderUpColor:"#26a69a", borderDownColor:"#ef5350",
-    wickUpColor:"#26a69a",  wickDownColor:"#ef5350"
-  });
-  sVol = kChart.addHistogramSeries({
-    priceScaleId:"", priceFormat:{ type:"volume" }, base:0, color:"#888"
-  });
-  kChart.priceScale("").applyOptions({ scaleMargins:{ top:0.8, bottom:0 } });
-  sMA5  = kChart.addLineSeries({ color:"#facc15", lineWidth:2 });
-  sMA20 = kChart.addLineSeries({ color:"#e879f9", lineWidth:2 });
-  sMA60 = kChart.addLineSeries({ color:"#60a5fa", lineWidth:2 });
-}
-
-function rangeByInterval(interval){
-  switch(interval){
-    case "5m":  return "5d";
-    case "15m": return "10d";
-    case "30m": return "1mo";
-    case "60m": return "3mo";
-    default:    return "6mo";
-  }
-}
-
-async function renderK(symbol, interval){
-  ensureKChart();
-  const range = rangeByInterval(interval);
-  const json = await fetchYahooChart(symbol, range, interval);
-  const { candles, volumes } = toCandles(json);
-  if(candles.length < 5) throw new Error("資料不足");
-
-  sCandle.setData(candles);
-  sVol.setData(volumes);
-  const ma5  = smaSeries(candles, 5);
-  const ma20 = smaSeries(candles, 20);
-  const ma60 = smaSeries(candles, 60);
-  sMA5.setData(ma5);
-  sMA20.setData(ma20);
-  sMA60.setData(ma60);
-  kChart.timeScale().fitContent();
-
-  const last = candles.at(-1);
-  const v = (x)=> (x??0).toFixed(2);
-  $("kLegend").textContent =
-    `O:${v(last.open)} H:${v(last.high)} L:${v(last.low)} C:${v(last.close)}  | ` +
-    `MA5:${v(ma5.at(-1)?.value)}  MA20:${v(ma20.at(-1)?.value)}  MA60:${v(ma60.at(-1)?.value)}`;
-
-  // === 先顯示「本地規則型」建議（一定會有） ===
-  const localAdvice = makeFullAdvice(candles, volumes, ma5, ma20, ma60);
-  safeSetAdvice(localAdvice);
-
-  // === 再嘗試「雲端 AI 總結」（可選） ===
-  if(OPENAI_PROXY_URL){
-    try{
-      const prompt = buildAIPrompt(symbol, candles, ma5, ma20, ma60, volumes);
-      const ai = await fetchAIAdvice(prompt, 12000);
-      if(ai && ai.trim()){
-        safeSetAdvice(`${localAdvice}\n\n———\n🧠 雲端 AI 總結：\n${ai.trim()}`);
-      }
-    }catch(e){
-      console.warn("AI 總結失敗：", e.message);
-      // 不覆蓋本地建議，只在狀態列提示
-      setStatus(`AI 總結失敗：${e.message}`);
-    }
-  }
-}
-
-// ===================== 走勢 ↔ 即時價 =====================
-function formatTs(ts){
-  try { return new Date(ts*1000).toLocaleString(); }
-  catch { return String(ts); }
-}
-
-async function refreshQuote(){
-  const raw = $("symbol").value;
-  const symbol = normalizeSymbol(raw);
-  if(!symbol){ alert("請先輸入代號"); return; }
-
+/* =========================================================
+   主流程
+   ========================================================= */
+async function refreshQuoteAndChart(){
   try{
-    setStatus("讀取中…");
-    const base = await fetchYahooChart(symbol, "6mo", "1d");
-    const r = base?.chart?.result?.[0];
-    if(!r) throw new Error("無資料");
+    const raw = symbolInput.value;
+    if(!raw){ alert("請輸入股票代號（台股輸入數字即可）"); return; }
+    const sym = normSymbol(raw);
 
-    const closeArr = r.indicators?.quote?.[0]?.close || [];
-    const lastClose = closeArr.at(-1);
-    const ts = (r.timestamp || []).at(-1);
+    setStatus("開始讀取…");
+    // 1) 即時價
+    const q = await getRealtime(sym);
+    priceInfoEl.textContent  = `${sym} 最新/開/高/低： ${q.last} / ${q.open} / ${q.high} / ${q.low}`;
+    updateTimeEl.textContent = `最後更新：${tsToLocal(q.time)}（免費來源可能有延遲）`;
 
-    $("priceInfo").textContent = `${symbol} 最新/收盤：${Number(lastClose||0).toFixed(2)}`;
-    $("updateTime").textContent = `更新時間：${formatTs(ts)}（Yahoo 可能延遲 10–20 分）`;
+    // 2) K 線
+    ensureChart();
+    const interval = kIntervalSel.value; // 1d, 5m, 15m, 30m, 60m
+    const isDaily = interval === "1d";
+    const range = isDaily ? "6mo" : "5d"; // 分K範圍縮短以提升速度
+    const {candles, volumes} = await yahooChart(sym, range, interval === "1d" ? "1d" : interval);
+    candleSeries.setData(candles);
+    volSeries.setData(volumes);
+    ma5.setData(sma(candles,5));
+    ma20.setData(sma(candles,20));
+    ma60.setData(sma(candles,60));
 
-    const itv = $("kInterval").value || "1d";
-    await renderK(symbol, itv);
+    // 3) 顯示當下 OHLC 與 MA 提示
+    const last = candles[candles.length-1] || {};
+    const ma5v  = (ma5._series?._data?.at?.(-1)?.value)  ?? (sma(candles,5).at(-1)?.value);
+    const ma20v = (ma20._series?._data?.at?.(-1)?.value) ?? (sma(candles,20).at(-1)?.value);
+    const ma60v = (ma60._series?._data?.at?.(-1)?.value) ?? (sma(candles,60).at(-1)?.value);
+    kLegend.textContent = `O:${(last.open??"—")} H:${(last.high??"—")} L:${(last.low??"—")} C:${(last.close??"—")} | MA5:${(ma5v??"—")} MA20:${(ma20v??"—")} MA60:${(ma60v??"—")}`;
+
+    // 4) 簡易 AI（規則）建議：不使用雲端 AI
+    aiAdviceEl.textContent = buildRuleAdvice(q.last, {ma5:ma5v, ma20:ma20v, ma60:ma60v}, volumes.at?.(-1)?.value || 0);
 
     setStatus("完成");
   }catch(e){
     console.error(e);
-    setStatus("讀取失敗：" + e.message);
-    alert("讀取失敗：" + e.message);
+    setStatus("");
+    alert(`讀取失敗：${e.message||e}`);
   }
 }
 
-// ===================== 規則型 AI（本地） =====================
-function avg(arr, n){
-  if(!arr?.length) return 0;
-  const m = Math.max(1, Math.min(n, arr.length));
-  let s = 0;
-  for(let i=arr.length-m;i<arr.length;i++) s += (arr[i].value ?? arr[i]);
-  return s / m;
-}
+/* ---------- 規則版「AI 建議」：全本地運算 ---------- */
+function buildRuleAdvice(price, ma, vol){
+  const lines=[];
+  if(ma.ma5 && ma.ma20 && ma.ma60){
+    const up  = price>ma.ma5 && ma.ma5>ma.ma20 && ma.ma20>ma.ma60;
+    const dn  = price<ma.ma5 && ma.ma5<ma.ma20 && ma.ma20<ma.ma60;
+    const gold = ma.ma5>ma.ma20 && Math.abs(ma.ma5-ma.ma20)/ma.ma20<0.01;
+    const dead = ma.ma5<ma.ma20 && Math.abs(ma.ma5-ma.ma20)/ma.ma20<0.01;
 
-function makeTrendStructureAdvice(candles){
-  const N = Math.min(60, candles.length);
-  const slice = candles.slice(-N);
-  let higherHighs = 0, higherLows = 0, lowerHighs = 0, lowerLows = 0;
-
-  for(let i=1;i<slice.length;i++){
-    if(slice[i].high > slice[i-1].high) higherHighs++; else if(slice[i].high < slice[i-1].high) lowerHighs++;
-    if(slice[i].low  > slice[i-1].low ) higherLows++;  else if(slice[i].low  < slice[i-1].low ) lowerLows++;
+    if(up)  lines.push("趨勢：多頭排列，偏多觀察；回檔近 MA5/20 可分批。");
+    if(dn)  lines.push("趨勢：空頭排列，偏空觀察；反彈靠近 MA20/60 易遇壓。");
+    if(gold)lines.push("訊號：MA5 上穿 MA20（黃金交叉）— 短線偏多。");
+    if(dead)lines.push("訊號：MA5 下破 MA20（死亡交叉）— 短線轉弱。");
   }
-
-  let view = "結構：震盪整理";
-  if(higherHighs > lowerHighs && higherLows > lowerLows) view = "結構：上升通道（高低點同步墊高）";
-  if(lowerHighs > higherHighs && lowerLows > higherLows) view = "結構：下降通道（高低點同步下移）";
-
-  let streakHigh = 0, streakLow = 0;
-  for(let i=slice.length-1;i>0;i--){
-    if(slice[i].high >= slice[i-1].high) { streakHigh++; } else break;
+  if(vol){
+    lines.push(`量能：最新量 ${Intl.NumberFormat().format(vol)}，搭配價位判斷突破/假突破。`);
   }
-  for(let i=slice.length-1;i>0;i--){
-    if(slice[i].low  <= slice[i-1].low ) { streakLow++; } else break;
-  }
-  if(streakHigh >= 3) view += "；短線連續創高（留意追高風險）";
-  if(streakLow  >= 3) view += "；短線連續創低（留意超跌反彈）";
-
-  return view;
+  lines.push("免責聲明：僅供教育示範，非投資建議。");
+  return lines.join("\n");
 }
 
-function makeSupportResistanceAdvice(candles){
-  const N = Math.min(20, candles.length);
-  const win = candles.slice(-N);
-  const hi = Math.max(...win.map(b=>b.high));
-  const lo = Math.min(...win.map(b=>b.low));
-  const last = candles.at(-1);
-  const a = atr(candles, 14);
-  const nearPct = 0.01;
-  const nearStr = (px) => Math.abs(last.close - px)/px <= nearPct ? "（接近）" : "";
-  return [
-    `壓力區：約 ${hi.toFixed(2)} ${nearStr(hi)}（觀察放量突破）`,
-    `支撐區：約 ${lo.toFixed(2)} ${nearStr(lo)}（跌破小心續弱）`,
-    `ATR(14) ≈ ${a.toFixed(2)}（安全邊際）`
-  ].join("；");
-}
+/* ---------- 綁定事件 ---------- */
+fetchBtn?.addEventListener("click", refreshQuoteAndChart);
+kRefreshBtn?.addEventListener("click", refreshQuoteAndChart);
+// Enter 快捷
+symbolInput?.addEventListener("keydown", (e)=>{ if(e.key==="Enter") refreshQuoteAndChart(); });
 
-function makeVolumeAnomalyAdvice(candles, volumes){
-  const last = candles.at(-1);
-  const volNow = volumes.at(-1)?.value ?? 0;
-  const vol20  = avg(volumes.map(v=>({value:v.value})), 20);
-  const spike = vol20 ? volNow / vol20 : 1;
-
-  const body = Math.abs(last.close - last.open);
-  const range = last.high - last.low || 1;
-  const bodyRatio = body / range;
-  let bodyView = "";
-  if(bodyRatio >= 0.7) bodyView = "長實體K（趨勢明確）";
-  else if(bodyRatio <= 0.3) bodyView = "長影線K（多空拉鋸）";
-  else bodyView = "中等實體K";
-
-  let volView = `量能：${spike.toFixed(2)}x / 20日均量`;
-  if(spike >= 2.0) volView += "（異常放大，可能突破/出貨）";
-  else if(spike <= 0.6) volView += "（顯著量縮，籌碼沉澱）";
-
-  return `${volView}；${bodyView}`;
-}
-
-function makeTechnicalAdvice(candles, ma5, ma20, ma60){
-  const p = candles.at(-1).close;
-  const m5  = ma5.at(-1)?.value ?? p;
-  const m20 = ma20.at(-1)?.value ?? p;
-  const m60 = ma60.at(-1)?.value ?? p;
-
-  let trend = "盤整/轉折觀察";
-  if(m5 > m20 && m20 > m60) trend = "多頭排列（偏多）";
-  if(m5 < m20 && m20 < m60) trend = "空頭排列（偏空）";
-
-  let cross = "均線交叉：無明顯交叉";
-  const prev5  = ma5.at(-2)?.value;
-  const prev20 = ma20.at(-2)?.value;
-  if(prev5 && prev20){
-    if(prev5 < prev20 && m5 > m20) cross = "⚡ MA5 上穿 MA20（黃金交叉）";
-    if(prev5 > prev20 && m5 < m20) cross = "⚠ MA5 下穿 MA20（死亡交叉）";
-  }
-
-  const rsi = rsiSeries(candles, 14);
-  const r = rsi.at(-1)?.value ?? 50;
-  let rsiView = `RSI(14)：${r.toFixed(1)}`;
-  if(r >= 70) rsiView += "（偏熱/易震盪）";
-  else if(r <= 30) rsiView += "（偏冷/留意反彈）";
-
-  let pos = "價格位於均線附近";
-  if(p > m5 && p > m20 && p > m60) pos = "價格在均線之上（多方優勢）";
-  if(p < m5 && p < m20 && p < m60) pos = "價格在均線之下（空方優勢）";
-
-  return { summary: [`趨勢：${trend}`, pos, cross, rsiView].join("；"), rsi:r, m5, m20, m60, price:p };
-}
-
-function makeOverallSentiment(tech, volumes){
-  let score = 0;
-  if(tech.m5 > tech.m20) score += 1; else score -= 1;
-  if(tech.m20 > tech.m60) score += 1; else score -= 1;
-  if(tech.rsi >= 60) score += 1;
-  if(tech.rsi <= 40) score -= 1;
-  if(tech.price > tech.m60) score += 1; else score -= 1;
-
-  const volNow = volumes.at(-1)?.value ?? 0;
-  const vol20  = avg(volumes.map(v=>({value:v.value})), 20);
-  if(vol20){
-    const spike = volNow / vol20;
-    if(spike >= 1.5) score += 1;
-    if(spike <= 0.7) score -= 1;
-  }
-
-  let mood = "🌫 中性";
-  if(score >= 3) mood = "🔥 強多";
-  else if(score === 2) mood = "🌤 偏多";
-  else if(score <= -3) mood = "❄ 強空";
-  else if(score === -2) mood = "🌧 偏空";
-
-  let action = "中性觀望，聚焦支撐/壓力與風險控管。";
-  if(mood === "🔥 強多") action = "偏多操作：回檔靠近 MA20 可分批布局，跌破 MA20 嚴設停損。";
-  if(mood === "🌤 偏多") action = "順勢做多，遇壓力不過先減碼。";
-  if(mood === "🌧 偏空") action = "反彈不過 MA20/MA60 以逢高減碼為主。";
-  if(mood === "❄ 強空") action = "保守應對：反彈減碼，僅短線試單，嚴格控風險。";
-
-  return `${mood}｜${action}`;
-}
-
-function makeFullAdvice(candles, volumes, ma5, ma20, ma60){
-  const a1 = makeTrendStructureAdvice(candles);
-  const a2 = makeSupportResistanceAdvice(candles);
-  const tech = makeTechnicalAdvice(candles, ma5, ma20, ma60);
-  const a3 = makeVolumeAnomalyAdvice(candles, volumes);
-  const mood = makeOverallSentiment(tech, volumes);
-
-  return [
-    a1,
-    a2,
-    tech.summary,
-    a3,
-    `綜合判斷：${mood}`,
-    "（以上僅供教育與研究使用，非投資建議）"
-  ].join("\n");
-}
-
-// ===================== 雲端 AI（可選，用代理端點） =====================
-function buildAIPrompt(symbol, candles, ma5, ma20, ma60, volumes){
-  const last = candles.at(-1);
-  const v = (x)=> (x??0).toFixed(2);
-  const m5  = v(ma5.at(-1)?.value);
-  const m20 = v(ma20.at(-1)?.value);
-  const m60 = v(ma60.at(-1)?.value);
-  const volNow = volumes.at(-1)?.value ?? 0;
-
-  return [
-    `請扮演專業台股/美股技術分析師，以精煉中文產出 120~180 字的結論與操作框架，避免過度保守或武斷。`,
-    `重點：趨勢（均線結構）、關鍵價位（支撐/壓力）、風險（停損/部位）、倉位建議（區間）。`,
-    `標的：${symbol}`,
-    `最新 O:${v(last.open)} H:${v(last.high)} L:${v(last.low)} C:${v(last.close)} 量:${volNow}`,
-    `MA5:${m5}  MA20:${m20}  MA60:${m60}`,
-    `請以「結論一句話」開頭，接著條列 3~4 點行動事項。`
-  ].join("\n");
-}
-
-async function fetchAIAdvice(prompt, timeoutMs = 12000){
-  const body = {
-    model: OPENAI_MODEL,
-    messages: [
-      { role:"system", content:"你是嚴謹的技術分析顧問，輸出簡潔可執行的觀點。" },
-      { role:"user", content: prompt }
-    ],
-    temperature: 0.6,
-    max_tokens: 320
-  };
-  const res = await fetchTimeout(OPENAI_PROXY_URL, {
-    method:"POST",
-    headers:{ "Content-Type":"application/json" },
-    body: JSON.stringify(body)
-  }, timeoutMs);
-  if(!res.ok) throw new Error(`AI http ${res.status}`);
-  const json = await res.json();
-  // 常見 proxy 會回成：{choices:[{message:{content:"..."}}]}
-  return json?.choices?.[0]?.message?.content || json?.content || "";
-}
-
-// ===================== 綁定事件 =====================
-$("fetchBtn").addEventListener("click", refreshQuote);
-$("kRefresh").addEventListener("click", async ()=>{
-  const raw = $("symbol").value;
-  const symbol = normalizeSymbol(raw);
-  const itv = $("kInterval").value || "1d";
-  try{
-    setStatus("更新 K 線中…");
-    await renderK(symbol, itv);
-    setStatus("完成");
-  }catch(e){
-    console.error(e);
-    setStatus("K 線讀取失敗：" + e.message);
-    alert("K 線讀取失敗：" + e.message);
-  }
-});
-$("symbol").addEventListener("keydown", (e)=>{ if(e.key==="Enter") $("fetchBtn").click(); });
-
-// 預設載入
-window.addEventListener("load", ()=>{
-  $("symbol").value = "AAPL";
-  safeSetAdvice("（準備中…）");
-  $("fetchBtn").click();
-});
+/* ---------- 預設：若有值自動載入 ---------- */
+setTimeout(()=>{
+  if(symbolInput && symbolInput.value){ refreshQuoteAndChart(); }
+}, 300);
